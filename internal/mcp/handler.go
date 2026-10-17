@@ -197,7 +197,7 @@ func (h *Handler) handleToolsCall(r *http.Request, req Request) *Response {
 
 	// Меры по закупочной стоимости закрыты отдельным правом. Раньше оно жило только в схеме
 	// (stripCostMeasures вырезает их из enum в tools/list), а вызов не проверялся вовсе: клиент,
-	// проигнорировавший схему, спокойно просил measures:[\"profit\"]. Единственной защитой оставался
+	// проигнорировавший схему, спокойно просил measures:["profit"]. Единственной защитой оставался
 	// заголовок X-MCP-Scopes на стороне 1С — которого в режиме статического токена вообще нет.
 	if auth != nil && !auth.HasScope(ScopeReportCost) {
 		if blocked := costMeasuresIn(params.Name, params.Arguments); len(blocked) > 0 {
@@ -1267,7 +1267,7 @@ func clampDepth(depth flexInt) int {
 
 // costMeasuresIn возвращает запрошенные меры, закрытые правом mcp:report:cost.
 // Аргументы разбираются как есть (map от json.Unmarshal), с поправкой на двойное кодирование:
-// measures может приехать строкой \"[\\\"profit\\\"]\" — тогда его развернёт unstringifyJSON.
+// measures может приехать строкой "[\"profit\"]" — тогда его развернёт unstringifyJSON.
 // unknownFilterKeys сверяет ключи filters в теле вызова со схемой инструмента и
 // возвращает те, которых схема не объявляет, вместе со списком поддержанных.
 // Источник истины — та же InputSchema, что уходит клиенту в tools/list, уже с профилем
@@ -1437,7 +1437,7 @@ func mapToStruct(m any, v any) error {
 // unstringifyJSON рекурсивно заменяет строки, содержащие валидный JSON-объект или массив,
 // на распарсенное значение. Компенсирует LLM-клиентов, которые иногда сериализуют вложенные
 // аргументы (period, filters, sort) в строку — тогда прямой Unmarshal падает с
-// \"cannot unmarshal string into Go struct field ...\". Пустую строку / невалидный JSON не трогаем
+// "cannot unmarshal string into Go struct field ...". Пустую строку / невалидный JSON не трогаем
 // (эти случаи по object-типам добираются толерантным UnmarshalJSON в onec.models).
 func unstringifyJSON(v any) any {
 	switch t := v.(type) {
@@ -1451,8 +1451,6 @@ func unstringifyJSON(v any) any {
 			t[i] = unstringifyJSON(val)
 		}
 		return t
-	default:
-		return v
 	case string:
 		s := strings.TrimSpace(t)
 		if len(s) >= 2 && (s[0] == '{' || s[0] == '[') {
@@ -1462,5 +1460,7 @@ func unstringifyJSON(v any) any {
 			}
 		}
 		return t
+	default:
+		return v
 	}
 }
