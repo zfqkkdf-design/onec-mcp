@@ -1,0 +1,59 @@
+server:
+  host: 0.0.0.0
+  port: 8088
+
+# Единый SQLite: и настройки баз 1С, и OAuth-клиенты/токены. Один файл = один бэкап.
+database:
+  path: "data/onec-mcp.db"
+
+# Веб-интерфейс /admin, где заводятся и правятся базы 1С. Учётка только здесь:
+# в БД лежат базы, а не администраторы.
+admin:
+  enabled: true
+  username: "admin"
+  password: "change-me"
+
+limits:
+  resolve_limit: 10
+  max_rows: 5000
+
+mcp:
+  enabled: true
+
+# OAuth 2.1 AS+RS встроенный в гейт. Включай при подключении к Claude/ChatGPT как custom connector.
+# При enabled=true /{slug}/mcp защищается OAuth Bearer (статический mcp_token базы игнорируется).
+#
+# AS поднимается по одному на базу:
+#   issuer   = public_url + "/" + slug          (https://onec.nomadus.net/tenant1)
+#   resource = issuer + "/mcp"                  (https://onec.nomadus.net/tenant1/mcp)
+# Токен, выпущенный для одной базы, не пройдёт audience-проверку на другой.
+oauth:
+  enabled: false
+  public_url: "https://onec.nomadus.net"   # КОРНЕВОЙ внешний URL гейта, без слага и без trailing slash
+  access_token_ttl: "1h"
+  refresh_token_ttl: "720h"
+  auth_code_ttl: "10m"
+  # default_scopes — выдаются клиенту, если он не запросил конкретные.
+  default_scopes:
+    - "mcp:resolve"
+    - "mcp:report:sales"
+    - "mcp:report:stock"
+  # supported_scopes — полный список анонсируемых/допустимых scope. Должен включать ВСЕ scope из
+  # ToolScopes, иначе соответствующие инструменты режутся при DCR-регистрации до выпуска токена.
+  # Пусто = берётся из default_scopes. Любая база может переопределить оба списка в /admin.
+  supported_scopes:
+    - "mcp:resolve"
+    - "mcp:report:sales"
+    - "mcp:report:stock"
+    - "mcp:report:money"
+    - "mcp:report:cost"
+    - "mcp:admin:eventlog"
+  # Per-IP лимиты на минуту, 0 = отключено. Защита от brute-force ключей. Общие для всех баз.
+  rate_limit:
+    authorize_per_minute: 10
+    register_per_minute: 30
+    token_per_minute: 120
+
+# Баз 1С в конфиге нет — они хранятся в SQLite и заводятся через /admin.
+# На чистой БД гейт поднимется без единого маршрута, кроме /health и /admin: это нормально,
+# первым шагом надо зайти в /admin и добавить базу.
