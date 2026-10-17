@@ -427,7 +427,7 @@ func TestRealProfileShapesTools(t *testing.T) {
 	}
 
 	// Закупки в этой базе считаются по регистру, где нет ни склада, ни валюты, ни
-// признака «в пути», зато есть договор и подразделение.
+	// признака «в пути», зато есть договор и подразделение.
 	purchases := findTool(t, tools, ToolPurchasesReport)
 
 	if hasFilter(t, purchases, "warehouse_ids") {
