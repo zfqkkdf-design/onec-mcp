@@ -1,0 +1,176 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Build binary
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o onec-mcp ./cmd/server
+
+      - name: Generate config
+        env:
+          # Базы 1С в конфиге больше не описываются: они лежат в SQLite (database.path)
+          # и заводятся через /admin. Здесь — только то, что нужно, чтобы гейт поднялся.
+          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          DATABASE_PATH: ${{ secrets.DATABASE_PATH }}
+          # OAuth — задайте OAUTH_PUBLIC_URL чтобы включить OAuth-режим (Custom Connector в Claude/ChatGPT).
+          # Это КОРНЕВОЙ URL гейта, без слага базы: слаг добавляется автоматически.
+          # Остальные секреты опциональны: TTL/rate-limit имеют дефолты, переопределяются только при необходимости.
+          OAUTH_PUBLIC_URL: ${{ secrets.OAUTH_PUBLIC_URL }}
+          OAUTH_ACCESS_TOKEN_TTL: ${{ secrets.OAUTH_ACCESS_TOKEN_TTL }}
+          OAUTH_REFRESH_TOKEN_TTL: ${{ secrets.OAUTH_REFRESH_TOKEN_TTL }}
+          OAUTH_AUTH_CODE_TTL: ${{ secrets.OAUTH_AUTH_CODE_TTL }}
+          OAUTH_RL_AUTHORIZE: ${{ secrets.OAUTH_RL_AUTHORIZE }}
+          OAUTH_RL_REGISTER: ${{ secrets.OAUTH_RL_REGISTER }}
+          OAUTH_RL_TOKEN: ${{ secrets.OAUTH_RL_TOKEN }}
+        run: |
+          set -x
+          which yq
+          yq --version
+
+          cat > onec-mcp.yml <<'EOF'
+          server:
+            host: 127.0.0.1
+            port: 8088
+
+          database:
+            path: "/var/lib/onec-mcp/onec-mcp.db"
+
+          admin:
+            enabled: true
+            username: ""
+            password: ""
+
+          limits:
+            resolve_limit: 10
+            max_rows: 5000
+
+          mcp:
+            enabled: true
+
+          oauth:
+            enabled: false
+            public_url: ""
+            access_token_ttl: "1h"
+            refresh_token_ttl: "720h"
+            auth_code_ttl: "10m"
+            default_scopes:
+              - "mcp:resolve"
+              - "mcp:report:sales"
+              - "mcp:report:stock"
+            supported_scopes:
+              - "mcp:resolve"
+              - "mcp:report:sales"
+              - "mcp:report:stock"
+              - "mcp:report:money"
+              - "mcp:report:cost"
+              - "mcp:admin:eventlog"
+            rate_limit:
+              authorize_per_minute: 10
+              register_per_minute: 30
+              token_per_minute: 120
+          EOF
+
+          # Без учётки /admin недостижим, а базы заводятся только там — гейт просто не стартует.
+          if [ -z "${ADMIN_USERNAME:-}" ] || [ -z "${ADMIN_PASSWORD:-}" ]; then
+            echo "ADMIN_USERNAME / ADMIN_PASSWORD secrets are required" >&2
+            exit 1
+          fi
+          yq -i ".admin.username = strenv(ADMIN_USERNAME)" onec-mcp.yml
+          yq -i ".admin.password = strenv(ADMIN_PASSWORD)" onec-mcp.yml
+
+          if [ -n "${DATABASE_PATH:-}" ]; then
+            yq -i ".database.path = strenv(DATABASE_PATH)" onec-mcp.yml
+          fi
+
+          # OAuth включается автоматически при заданном OAUTH_PUBLIC_URL.
+          # Без него гейт остаётся в статическом режиме с mcp_token, заданным у базы в /admin.
+          # Все блоки — явные if/then/fi, чтобы set -e не споткнулся о пустые && chains.
+          if [ -n "${OAUTH_PUBLIC_URL:-}" ]; then
+            yq -i ".oauth.enabled = true" onec-mcp.yml
+            yq -i ".oauth.public_url = strenv(OAUTH_PUBLIC_URL)" onec-mcp.yml
+          fi
+          if [ -n "${OAUTH_ACCESS_TOKEN_TTL:-}" ]; then
+            yq -i ".oauth.access_token_ttl = strenv(OAUTH_ACCESS_TOKEN_TTL)" onec-mcp.yml
+          fi
+          if [ -n "${OAUTH_REFRESH_TOKEN_TTL:-}" ]; then
+            yq -i ".oauth.refresh_token_ttl = strenv(OAUTH_REFRESH_TOKEN_TTL)" onec-mcp.yml
+          fi
+          if [ -n "${OAUTH_AUTH_CODE_TTL:-}" ]; then
+            yq -i ".oauth.auth_code_ttl = strenv(OAUTH_AUTH_CODE_TTL)" onec-mcp.yml
+          fi
+          # rate-limit — числа, env() в yq парсит значение в int
+          if [ -n "${OAUTH_RL_AUTHORIZE:-}" ]; then
+            yq -i ".oauth.rate_limit.authorize_per_minute = env(OAUTH_RL_AUTHORIZE)" onec-mcp.yml
+          fi
+          if [ -n "${OAUTH_RL_REGISTER:-}" ]; then
+            yq -i ".oauth.rate_limit.register_per_minute = env(OAUTH_RL_REGISTER)" onec-mcp.yml
+          fi
+          if [ -n "${OAUTH_RL_TOKEN:-}" ]; then
+            yq -i ".oauth.rate_limit.token_per_minute = env(OAUTH_RL_TOKEN)" onec-mcp.yml
+          fi
+
+          echo "=== generated config ==="
+          # Скрываем секреты в логе — печатаем структуру без значений строковых полей
+          yq '(.. | select(tag == "!!str")) = "***"' onec-mcp.yml
+
+      - name: Copy files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "onec-mcp,onec-mcp.yml,deploy/onec-mcp.service"
+          target: /tmp/onec-mcp-deploy/
+          strip_components: 0
+
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            sudo mkdir -p /etc/conf
+            sudo mkdir -p /opt/onec-mcp
+            # Постоянный каталог для SQLite OAuth-хранилища. Содержит клиентов и активные токены —
+            # сохраняется между деплоями, чтобы пользователи не пере-логинивались каждый раз.
+            sudo mkdir -p /var/lib/onec-mcp
+            sudo chmod 700 /var/lib/onec-mcp
+
+            sudo systemctl stop onec-mcp || true
+
+            sudo cp /tmp/onec-mcp-deploy/onec-mcp /opt/onec-mcp/onec-mcp
+            sudo chmod +x /opt/onec-mcp/onec-mcp
+
+            sudo cp /tmp/onec-mcp-deploy/onec-mcp.yml /etc/conf/onec-mcp.yml
+            sudo chmod 600 /etc/conf/onec-mcp.yml
+
+            sudo cp /tmp/onec-mcp-deploy/deploy/onec-mcp.service /etc/systemd/system/onec-mcp.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable onec-mcp
+            sudo systemctl start onec-mcp
+
+            rm -rf /tmp/onec-mcp-deploy
+
+            sleep 2
+            sudo systemctl status onec-mcp --no-pager
