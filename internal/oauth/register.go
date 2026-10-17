@@ -150,7 +150,7 @@ func isAllowedRedirectURI(raw string) bool {
 		return true
 	}
 	if u.Scheme == "http" {
-	host := u.Hostname()
+		host := u.Hostname()
 		return host == "localhost" || host == "127.0.0.1" || host == "::1"
 	}
 	return false
