@@ -32,7 +32,7 @@ func TestResolveCacheRoundTrip(t *testing.T) {
 	}
 }
 
-// TestResolveCacheKeyDimensions пинит все три измерения ключа. Схлопывание любого из них —
+// TestResolveCacheKeyDimensions пиннит все три измерения ключа. Схлопывание любого из них —
 // это выдача одной базы/области видимости в ответ на запрос другой; ровно так уже ломались
 // includeGroups у cost_article и производственные склады у warehouse.
 func TestResolveCacheKeyDimensions(t *testing.T) {
