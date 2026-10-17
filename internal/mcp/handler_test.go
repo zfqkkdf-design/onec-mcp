@@ -1,0 +1,779 @@
+package mcp
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"example.com/mcp-sales-mvp/internal/config"
+	"example.com/mcp-sales-mvp/internal/onec"
+)
+
+// fake1C — заглушка 1С: записывает тела полученных запросов и отдаёт заранее заданный ответ.
+type fake1C struct {
+	mu       sync.Mutex
+	requests []recorded
+	response string
+}
+
+type recorded struct {
+	path string
+	body map[string]any
+}
+
+func (f *fake1C) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Профиль с полным набором инструментов: тесты вызова проверяют разбор аргументов,
+		// а не opt-in профиля (он проверяется в profile_test.go). В записанные запросы
+		// health не попадает, иначе съехали бы индексы в fake.recorded.
+		if r.URL.Path == "/mcp/health" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, fullProfileHealth())
+			return
+		}
+
+		raw, _ := io.ReadAll(r.Body)
+
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+
+		f.mu.Lock()
+		f.requests = append(f.requests, recorded{path: r.URL.Path, body: body})
+		resp := f.response
+		f.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if resp == "" {
+			resp = `{"columns":[],"rows":[],"totals":{}}`
+		}
+		_, _ = io.WriteString(w, resp)
+	})
+}
+
+func (f *fake1C) recorded(t *testing.T, n int) recorded {
+	t.Helper()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if len(f.requests) <= n {
+		t.Fatalf("1C got %d requests, wanted at least %d", len(f.requests), n+1)
+	}
+	return f.requests[n]
+}
+
+func (f *fake1C) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.requests)
+}
+
+// newTestHandler поднимает заглушку 1С и MCP-хендлер поверх неё. Аутентификация выключена
+// (bearerToken пустой), поэтому tools/call проходит без OAuth-контекста.
+func newTestHandler(t *testing.T) (*Handler, *fake1C) {
+	t.Helper()
+
+	fake := &fake1C{}
+	srv := httptest.NewServer(fake.handler())
+	t.Cleanup(srv.Close)
+
+	client := onec.NewClient(onec.Settings{
+		BaseURL:         srv.URL,
+		Timeout:         5 * time.Second,
+		ReportTimeout:   5 * time.Second,
+		ResolveCacheTTL: time.Minute,
+	}, slog.New(slog.DiscardHandler))
+
+	cfg := &config.Config{}
+	cfg.Limits.MaxRows = 5000
+	cfg.Limits.ResolveLimit = 10
+
+	return NewHandler(client, cfg, "", slog.New(slog.DiscardHandler)), fake
+}
+
+// callTool прогоняет tools/call через ServeHTTP и возвращает распарсенный CallToolResult.
+func callTool(t *testing.T, h *Handler, tool string, args map[string]any) CallToolResult {
+	t.Helper()
+
+	params, err := json.Marshal(map[string]any{"name": tool, "arguments": args})
+	if err != nil {
+		t.Fatalf("marshal params: %v", err)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params":  json.RawMessage(params),
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tools/call: HTTP %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	var envelope struct {
+		Result CallToolResult `json:"result"`
+		Error  *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("unmarshal response %s: %v", rec.Body.String(), err)
+	}
+	if envelope.Error != nil {
+		t.Fatalf("tools/call returned a JSON-RPC error: %s", envelope.Error.Message)
+	}
+
+	return envelope.Result
+}
+
+func resultText(t *testing.T, res CallToolResult) string {
+	t.Helper()
+
+	if len(res.Content) == 0 {
+		t.Fatal("tool result has no content")
+	}
+	return res.Content[0].Text
+}
+
+// Фильтр, которого у инструмента нет, — ошибка вызова, а не пустое место. Тихо
+// отброшенный ключ опаснее отказа: 1С вернула бы полную выборку, а агент прочитал бы её
+// как отфильтрованную и не заметил подмены.
+func TestUnknownFilterKeyIsRejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		tool    string
+		args    map[string]any
+		unknown []string
+	}{
+		{
+			// cash_balance умеет фильтровать только по кассам и фирмам.
+			name: "cash_balance rejects cash_flow keys",
+			tool: ToolCashBalance,
+			args: map[string]any{
+				"filters": map[string]any{
+					"cash_ids":         []string{"cash-1"},
+					"operation_ids":    []string{"op-1"},
+					"cost_article_ids": []string{"art-1"},
+					"customer_ids":     []string{"cust-1"},
+				},
+			},
+			unknown: []string{"cost_article_ids", "customer_ids", "operation_ids"},
+		},
+		{
+			// receivables объявляет customer_ids, payables — supplier_ids.
+			name: "receivables rejects supplier_ids",
+			tool: ToolReceivablesBalance,
+			args: map[string]any{
+				"filters": map[string]any{
+					"customer_ids": []string{"cust-1"},
+					"supplier_ids": []string{"sup-1"},
+				},
+			},
+			unknown: []string{"supplier_ids"},
+		},
+		{
+			name: "payables rejects customer_ids",
+			tool: ToolPayablesBalance,
+			args: map[string]any{
+				"filters": map[string]any{
+					"customer_ids": []string{"cust-1"},
+					"supplier_ids": []string{"sup-1"},
+				},
+			},
+			unknown: []string{"customer_ids"},
+		},
+		{
+			// top_products — обёртка над sales-отчётом, но канал, когорту и статус ЖЦ
+			// в схеме не объявляет.
+			name: "top_products rejects sales-only keys",
+			tool: ToolTopProducts,
+			args: map[string]any{
+				"period": map[string]any{"from": "2026-01-01", "to": "2026-01-31"},
+				"filters": map[string]any{
+					"customer_ids":      []string{"cust-1"},
+					"sales_channel_ids": []string{"chan-1"},
+					"customer_cohort":   "new",
+					"product_status":    []string{"active"},
+				},
+			},
+			unknown: []string{"customer_cohort", "product_status", "sales_channel_ids"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, fake := newTestHandler(t)
+
+			res := callTool(t, h, tc.tool, tc.args)
+
+			if !res.IsError {
+				t.Fatal("call with an unsupported filter must fail")
+			}
+
+			text := resultText(t, res)
+			for _, key := range tc.unknown {
+				if !strings.Contains(text, key) {
+					t.Errorf("error must name the unsupported key %q, got: %s", key, text)
+				}
+			}
+
+			if n := fake.count(); n != 0 {
+				t.Errorf("1C got %d requests, wanted none: the call must not reach it", n)
+			}
+		})
+	}
+}
+
+// Поддержанные ключи по-прежнему доезжают до 1С — проверка неизвестных ключей не должна
+// задевать нормальный вызов.
+func TestKnownFiltersReach1C(t *testing.T) {
+	h, fake := newTestHandler(t)
+
+	callTool(t, h, ToolSalesReport, map[string]any{
+		"period": map[string]any{"from": "2026-01-01", "to": "2026-01-31"},
+		"filters": map[string]any{
+			"customer_ids": []string{"cust-1"},
+			"product_ids":  []string{"prod-1"},
+		},
+	})
+
+	filters, ok := fake.recorded(t, 0).body["filters"].(map[string]any)
+	if !ok {
+		t.Fatalf("filters missing in %v", fake.recorded(t, 0).body)
+	}
+
+	for _, key := range []string{"customer_ids", "product_ids"} {
+		if _, ok := filters[key]; !ok {
+			t.Errorf("%s must be forwarded to 1C", key)
+		}
+	}
+}
+
+// Отчёты декодируются в типизированную структуру, и раньше period/applied_filters из ответа 1С
+// терялись при пересборке — хотя схема инструмента их обещает.
+func TestSalesReportPreservesEchoFields(t *testing.T) {
+	h, fake := newTestHandler(t)
+	fake.response = `{"columns":[{"name":"amount","type":"number"}],"rows":[[10]],"totals":{"amount":10},
+		"period":{"from":"2026-01-01T00:00:00","to":"2026-01-31T23:59:59"},
+		"applied_filters":{"customers":[],"customer_cohort":"new"}}`
+
+	res := callTool(t, h, ToolSalesReport, map[string]any{
+		"period": map[string]any{"from": "2026-01-01", "to": "2026-01-31"},
+	})
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(resultText(t, res)), &got); err != nil {
+		t.Fatalf("unmarshal tool result: %v", err)
+	}
+
+	if _, ok := got["period"]; !ok {
+		t.Error("period from 1C must survive to the LLM")
+	}
+	if _, ok := got["applied_filters"]; !ok {
+		t.Error("applied_filters from 1C must survive to the LLM")
+	}
+	if _, ok := got["rows"]; !ok {
+		t.Error("rows must still be there")
+	}
+}
+
+// Остатки на дату отдают date, взаиморасчёты — date и role: те же echo-поля.
+func TestSettlementsPreservesRole(t *testing.T) {
+	h, fake := newTestHandler(t)
+	fake.response = `{"columns":[],"rows":[],"totals":{},"date":"2026-01-31T23:59:59","role":"customer"}`
+
+	res := callTool(t, h, ToolReceivablesBalance, map[string]any{})
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(resultText(t, res)), &got); err != nil {
+		t.Fatalf("unmarshal tool result: %v", err)
+	}
+
+	if got["role"] != "customer" {
+		t.Errorf("role = %v, want customer", got["role"])
+	}
+	if got["date"] != "2026-01-31T23:59:59" {
+		t.Errorf("date = %v", got["date"])
+	}
+}
+
+// Кэш резолва статей затрат обязан учитывать include_groups: иначе выдача без групп
+// затирает выдачу с группами на весь TTL, и запрошенные UUID групп не возвращаются.
+func TestResolveCostArticleCacheKeyIncludesGroups(t *testing.T) {
+	h, fake := newTestHandler(t)
+	fake.response = `{"candidates":[]}`
+
+	args := map[string]any{"query": "аренда"}
+	callTool(t, h, ToolResolveCostArticle, args)
+
+	withGroups := map[string]any{"query": "аренда", "include_groups": true}
+	callTool(t, h, ToolResolveCostArticle, withGroups)
+
+	if fake.count() != 2 {
+		t.Fatalf("1C got %d requests, want 2 — include_groups must not hit the cached no-groups answer", fake.count())
+	}
+
+	// повтор того же запроса обязан прийти из кэша
+	callTool(t, h, ToolResolveCostArticle, withGroups)
+	if fake.count() != 2 {
+		t.Fatalf("1C got %d requests, want 2 — identical resolve must be cached", fake.count())
+	}
+}
+
+// Админские инструменты шли мимо unstringifyJSON, и двойное кодирование period — ровно тот косяк
+// LLM, ради которого он написан, — ломало именно их.
+func TestEventLogUnstringifiesArguments(t *testing.T) {
+	h, fake := newTestHandler(t)
+	fake.response = `{"events":[]}`
+
+	callTool(t, h, ToolEventLog, map[string]any{
+		"period": `{"from":"2026-01-01","to":"2026-01-02"}`,
+		"limit":  10,
+	})
+
+	body := fake.recorded(t, 0).body
+	period, ok := body["period"].(map[string]any)
+	if !ok {
+		t.Fatalf("period reached 1C as %T (%v), want an object", body["period"], body["period"])
+	}
+	if period["from"] != "2026-01-01" {
+		t.Errorf("period.from = %v", period["from"])
+	}
+}
+
+// Журнал регистрации сканируется долго — он должен идти по «отчётному» таймауту, а не по
+// восьмисекундному, иначе выборка за сутки падает с context deadline exceeded.
+func TestAdminCallsUseReportTimeout(t *testing.T) {
+	fake := &fake1C{}
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"events":[]}`)
+	}))
+	t.Cleanup(slow.Close)
+	_ = fake
+
+	client := onec.NewClient(onec.Settings{
+		BaseURL:       slow.URL,
+		Timeout:       50 * time.Millisecond, // короткий: резолвы/auth
+		ReportTimeout: 5 * time.Second,       // длинный: отчёты и админ-вызовы
+	}, slog.New(slog.DiscardHandler))
+
+	cfg := &config.Config{}
+	cfg.Limits.MaxRows = 5000
+	cfg.Limits.ResolveLimit = 10
+
+	h := NewHandler(client, cfg, "", slog.New(slog.DiscardHandler))
+
+	res := callTool(t, h, ToolEventLog, map[string]any{"limit": 10})
+
+	if res.IsError {
+		t.Fatalf("event_log failed on the short timeout: %s", resultText(t, res))
+	}
+	if !strings.Contains(resultText(t, res), "events") {
+		t.Errorf("unexpected event_log result: %s", resultText(t, res))
+	}
+}
+
+// costMeasuresIn — основа проверки права mcp:report:cost на вызове (а не только в схеме).
+func TestCostMeasuresIn(t *testing.T) {
+	cases := []struct {
+		name string
+		tool string
+		args any
+		want int
+	}{
+		{"no measures", ToolSalesReport, map[string]any{"top": 10}, 0},
+		{"open measures", ToolSalesReport, map[string]any{"measures": []any{"amount", "qty"}}, 0},
+		{"cost measure", ToolSalesReport, map[string]any{"measures": []any{"amount", "profit"}}, 1},
+		{"all cost measures", ToolSalesReport, map[string]any{"measures": []any{"cost", "profit", "margin"}}, 3},
+		{"double-encoded", ToolSalesReport, map[string]any{"measures": `["margin"]`}, 1},
+		{"not a map", ToolSalesReport, []any{"nonsense"}, 0},
+		// amount закрыт у остатков (себестоимость партий) и открыт у продаж (выручка) —
+		// именно поэтому список закрытых мер привязан к инструменту.
+		{"stock amount is cost", ToolStockBalance, map[string]any{"measures": []any{"qty", "amount"}}, 1},
+		{"stock qty is open", ToolStockBalance, map[string]any{"measures": []any{"qty", "min_qty"}}, 0},
+		{"transit both amounts", ToolGoodsInTransit, map[string]any{"measures": []any{"amount", "amount_in_currency"}}, 2},
+		// закупки закрыты money-правом, и их amount правом на себестоимость не режется
+		{"purchases amount is open", ToolPurchasesReport, map[string]any{"measures": []any{"amount"}}, 0},
+		{"tool without cost measures", ToolCashFlow, map[string]any{"measures": []any{"net"}}, 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := costMeasuresIn(tc.tool, tc.args); len(got) != tc.want {
+				t.Errorf("costMeasuresIn(%q, %v) = %v, want %d entries", tc.tool, tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+// stripCostMeasures правит enum схемы для ключей без права на себестоимость: закрытые меры
+// должны исчезнуть у каждого инструмента из CostMeasures и остаться у всех прочих.
+func TestStripCostMeasures(t *testing.T) {
+	tools := GetTools()
+	stripCostMeasures(tools)
+
+	measureEnum := func(name string) []string {
+		t.Helper()
+		for _, tool := range tools {
+			if tool.Name != name {
+				continue
+			}
+			schema := tool.InputSchema.(map[string]any)
+			props := schema["properties"].(map[string]any)
+			measures, ok := props["measures"].(map[string]any)
+			if !ok {
+				t.Fatalf("tool %q has no measures", name)
+			}
+			return measures["items"].(map[string]any)["enum"].([]string)
+		}
+		t.Fatalf("tool %q not found", name)
+		return nil
+	}
+
+	has := func(enum []string, want string) bool {
+		for _, v := range enum {
+			if v == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, tc := range []struct {
+		tool    string
+		measure string
+		want    bool
+	}{
+		{ToolSalesReport, "profit", false},
+		{ToolSalesReport, "amount", true}, // выручка остаётся
+		{ToolStockBalance, "amount", false},
+		{ToolStockBalance, "qty", true},
+		{ToolGoodsInTransit, "amount", false},
+		{ToolGoodsInTransit, "amount_in_currency", false},
+		{ToolGoodsInTransit, "qty", true},
+		{ToolPurchasesReport, "amount", true}, // закупки закрыты money-правом, а не этим
+	} {
+		if got := has(measureEnum(tc.tool), tc.measure); got != tc.want {
+			t.Errorf("%s.measures contains %q = %v, want %v", tc.tool, tc.measure, got, tc.want)
+		}
+	}
+}
+
+func TestClampLimits(t *testing.T) {
+	h, _ := newTestHandler(t) // MaxRows=5000, ResolveLimit=10
+
+	t.Run("resolve limit", func(t *testing.T) {
+		cases := []struct{ in, want int }{
+			{0, 10}, {-5, 10}, {3, 3}, {10, 10}, {999, 10},
+		}
+		for _, tc := range cases {
+			if got := h.clampLimit(flexInt(tc.in)); got != tc.want {
+				t.Errorf("clampLimit(%d) = %d, want %d", tc.in, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("report rows", func(t *testing.T) {
+		cases := []struct{ in, want int }{
+			{0, 5000}, {-1, 5000}, {100, 100}, {5000, 5000}, {99999, 5000},
+		}
+		for _, tc := range cases {
+			if got := h.clampTop(flexInt(tc.in)); got != tc.want {
+				t.Errorf("clampTop(%d) = %d, want %d", tc.in, got, tc.want)
+			}
+		}
+	})
+
+	// max_rows — потолок и для значения по умолчанию: иначе вызывающий с завышенным дефолтом
+	// протаскивал бы мимо лимита ровно то, ради чего лимит и заведён.
+	t.Run("default is clamped too", func(t *testing.T) {
+		if got := h.clampTopDefault(0, 10); got != 10 {
+			t.Errorf("clampTopDefault(0, 10) = %d, want 10", got)
+		}
+		if got := h.clampTopDefault(0, 99999); got != 5000 {
+			t.Errorf("clampTopDefault(0, 99999) = %d, want 5000 — дефолт выше max_rows не урезан", got)
+		}
+		if got := h.clampTopDefault(50, 99999); got != 50 {
+			t.Errorf("clampTopDefault(50, 99999) = %d, want 50", got)
+		}
+	})
+}
+
+// TestFirmFilterReachesOneC — фильтр по фирме объявлен в структурах фильтров всех отчётов,
+// а не только у взаиморасчётов/закупок. Ключи, не объявленные в структуре, mapToStruct молча
+// выбрасывает — поэтому пропущенное поле проявилось бы как «фильтр применился», хотя в 1С
+// он не доехал, и цифры вернулись бы по всем фирмам.
+func TestFirmFilterReachesOneC(t *testing.T) {
+	cases := []struct {
+		tool string
+		path string
+		args map[string]any
+	}{
+		{ToolSalesReport, "/mcp/reports/sales", map[string]any{
+			"period": map[string]any{"from": "2026-01-01", "to": "2026-01-31"},
+		}},
+		{ToolStockBalance, "/mcp/reports/stock", map[string]any{}},
+		{ToolAvailabilityReport, "/mcp/reports/availability", map[string]any{
+			"period": map[string]any{"from": "2026-01-01", "to": "2026-01-31"},
+		}},
+		{ToolTopProducts, "/mcp/reports/top_products", map[string]any{
+			"period": map[string]any{"from": "2026-01-01", "to": "2026-01-31"},
+		}},
+		{ToolCashBalance, "/mcp/reports/cash_balance", map[string]any{}},
+		{ToolCashFlow, "/mcp/reports/cash_flow", map[string]any{
+			"period": map[string]any{"from": "2026-01-01", "to": "2026-01-31"},
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.tool, func(t *testing.T) {
+			h, fake := newTestHandler(t)
+
+			args := map[string]any{}
+			for k, v := range tc.args {
+				args[k] = v
+			}
+			args["filters"] = map[string]any{"firm_ids": []string{"firm-1"}}
+
+			callTool(t, h, tc.tool, args)
+
+			got := fake.recorded(t, 0)
+			if got.path != tc.path {
+				t.Fatalf("path = %s, want %s", got.path, tc.path)
+			}
+
+			filters, ok := got.body["filters"].(map[string]any)
+			if !ok {
+				t.Fatalf("filters missing in %v", got.body)
+			}
+			ids, ok := filters["firm_ids"].([]any)
+			if !ok || len(ids) != 1 || ids[0] != "firm-1" {
+				t.Errorf("firm_ids = %v, want [firm-1]", filters["firm_ids"])
+			}
+		})
+	}
+}
+
+// TestResolveFirmCallsOneC — маршрут нового резолвера: инструмент должен ходить
+// в /mcp/resolve/firm, а не переиспользовать чужой эндпойнт.
+func TestResolveFirmCallsOneC(t *testing.T) {
+	h, fake := newTestHandler(t)
+
+	callTool(t, h, ToolResolveFirm, map[string]any{"query": "ТОВ"})
+
+	got := fake.recorded(t, 0)
+	if got.path != "/mcp/resolve/firm" {
+		t.Fatalf("path = %s, want /mcp/resolve/firm", got.path)
+	}
+	if got.body["query"] != "ТОВ" {
+		t.Errorf("query = %v, want ТОВ", got.body["query"])
+	}
+}
+
+// Инструмент без записи в ToolScopes исчезает из tools/list для OAuth-ключей (фильтр
+// пропускает неизвестные) и отбивается на вызове — то есть новый инструмент, забытый в
+// карте прав, молча не существует. Проверяем всё разом, а не по одному имени.
+func TestEveryToolHasScope(t *testing.T) {
+	for _, tool := range GetTools() {
+		if _, ok := ToolScopes[tool.Name]; !ok {
+			t.Errorf("tool %q has no entry in ToolScopes", tool.Name)
+		}
+	}
+}
+
+// stock_reserves ходит в свой отчёт 1С и не выдумывает параметр date: регистр резервов
+// хранит текущее состояние, и «на дату» обещало бы историю, которой нет.
+func TestStockReservesRequest(t *testing.T) {
+	h, fake := newTestHandler(t)
+
+	callTool(t, h, ToolStockReserves, map[string]any{
+		"group_by": []string{"warehouse", "product", "customer", "document"},
+		"filters": map[string]any{
+			"customer_ids":   []string{"cust-1"},
+			"expires_before": "2026-09-07",
+		},
+	})
+
+	got := fake.recorded(t, 0)
+
+	if got.path != "/mcp/reports/reserves" {
+		t.Errorf("path = %q, want /mcp/reports/reserves", got.path)
+	}
+
+	if _, ok := got.body["date"]; ok {
+		t.Errorf("request must not carry date: %v", got.body)
+	}
+
+	filters, ok := got.body["filters"].(map[string]any)
+	if !ok {
+		t.Fatalf("filters missing in %v", got.body)
+	}
+
+	if filters["expires_before"] != "2026-09-07" {
+		t.Errorf("expires_before = %v, want 2026-09-07", filters["expires_before"])
+	}
+}
+
+// Отбор, которого у резервов нет (например, поставщик), должен отбиваться гейтом,
+// а не тихо теряться при разборе тела.
+func TestStockReservesRejectsUnknownFilter(t *testing.T) {
+	h, fake := newTestHandler(t)
+
+	res := callTool(t, h, ToolStockReserves, map[string]any{
+		"filters": map[string]any{"supplier_ids": []string{"sup-1"}},
+	})
+
+	if !res.IsError {
+		t.Fatal("unsupported filter must fail")
+	}
+	if !strings.Contains(resultText(t, res), "supplier_ids") {
+		t.Errorf("error must name the key, got: %s", resultText(t, res))
+	}
+	if n := fake.count(); n != 0 {
+		t.Errorf("1C got %d requests, wanted none", n)
+	}
+}
+
+// fullProfileHealth — ответ health базы, подтвердившей все инструменты гейта.
+func fullProfileHealth() string {
+	names := make([]string, 0, len(GetTools()))
+	for _, tool := range GetTools() {
+		names = append(names, tool.Name)
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"status": "ok",
+		"capabilities": map[string]any{
+			"profile": "test",
+			"version": onec.CapabilitiesVersion,
+			"tools":   map[string]any{"available": names},
+			// Отборы связи возврата с продажей объявлены только через extra.
+			"extra": map[string]any{
+				ToolReturnsReport: map[string]any{"filters": []string{"order_ids", "sale_document_ids"}},
+			},
+		},
+	})
+
+	return string(payload)
+}
+
+// Инструмент, который база не подтвердила, отбивается на вызове и в 1С не уходит.
+func TestUnconfirmedToolRejectedOnCall(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/mcp/health" {
+			_, _ = io.WriteString(w, `{"status":"ok","capabilities":{"version":2,"tools":{"available":["stock_balance"]}}}`)
+			return
+		}
+		t.Errorf("unconfirmed tool reached 1C: %s", r.URL.Path)
+		_, _ = io.WriteString(w, `{"columns":[],"rows":[],"totals":{}}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := onec.NewClient(onec.Settings{
+		BaseURL:       srv.URL,
+		Timeout:       2 * time.Second,
+		ReportTimeout: 2 * time.Second,
+	}, slog.New(slog.DiscardHandler))
+
+	cfg := &config.Config{}
+	cfg.Limits.MaxRows = 5000
+	cfg.Limits.ResolveLimit = 10
+	h := NewHandler(client, cfg, "", slog.New(slog.DiscardHandler))
+
+	res := callTool(t, h, ToolStockReserves, map[string]any{})
+	if !res.IsError {
+		t.Fatal("stock_reserves is not confirmed by the database but the call succeeded")
+	}
+	if len(res.Content) == 0 || !strings.Contains(res.Content[0].Text, "not available in this database") {
+		t.Errorf("unexpected rejection text: %+v", res.Content)
+	}
+}
+
+// returns_report ходит в /mcp/reports/returns и доносит до 1С все фильтры, включая channel.
+func TestReturnsReportRequest(t *testing.T) {
+	h, fake := newTestHandler(t)
+
+	callTool(t, h, ToolReturnsReport, map[string]any{
+		"period":   map[string]any{"from": "2026-09-01", "to": "2026-09-17"},
+		"group_by": []string{"channel", "reason"},
+		"filters": map[string]any{
+			"customer_ids":  []string{"cust-1"},
+			"warehouse_ids": []string{"wh-1"},
+			"product_ids":   []string{"prod-1"},
+			"channel":       "retail",
+			// Отборы из extra.filters профиля: в структуре они есть, иначе выпали бы при разборе.
+			"order_ids":         []string{"order-1"},
+			"sale_document_ids": []string{"sale-1"},
+		},
+	})
+
+	got := fake.recorded(t, 0)
+
+	if got.path != "/mcp/reports/returns" {
+		t.Errorf("path = %q, want /mcp/reports/returns", got.path)
+	}
+
+	filters, ok := got.body["filters"].(map[string]any)
+	if !ok {
+		t.Fatalf("filters missing in %v", got.body)
+	}
+
+	for _, key := range []string{"customer_ids", "warehouse_ids", "product_ids", "order_ids", "sale_document_ids"} {
+		if _, ok := filters[key]; !ok {
+			t.Errorf("filter %s did not reach 1C: %v", key, filters)
+		}
+	}
+
+	if filters["channel"] != "retail" {
+		t.Errorf("channel = %v, want retail", filters["channel"])
+	}
+
+	period, _ := got.body["period"].(map[string]any)
+	if period["from"] != "2026-09-01" || period["to"] != "2026-09-17" {
+		t.Errorf("period = %v", got.body["period"])
+	}
+}
+
+// Отбор из extra.filters принимается только там, где профиль его объявил: база без extra
+// отбивает sale_document_ids на входе, как и любой неизвестный фильтр, — иначе отчёт
+// вернулся бы без отбора и выглядел бы как ответ на вопрос.
+func TestExtraFilterRejectedWithoutProfile(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/mcp/health" {
+			_, _ = io.WriteString(w, `{"status":"ok","capabilities":{"version":2,"tools":{"available":["returns_report"]}}}`)
+			return
+		}
+		t.Errorf("1C got %s, the call should have been rejected by the gate", r.URL.Path)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := onec.NewClient(onec.Settings{BaseURL: srv.URL, Timeout: 5 * time.Second}, slog.New(slog.DiscardHandler))
+	h := NewHandler(client, &config.Config{}, "", slog.New(slog.DiscardHandler))
+
+	res := callTool(t, h, ToolReturnsReport, map[string]any{
+		"period":  map[string]any{"from": "2026-09-01", "to": "2026-09-17"},
+		"filters": map[string]any{"sale_document_ids": []string{"sale-1"}},
+	})
+
+	if !res.IsError || len(res.Content) == 0 || !strings.Contains(res.Content[0].Text, "sale_document_ids") {
+		t.Errorf("expected a rejection naming sale_document_ids, got %+v", res)
+	}
+}
