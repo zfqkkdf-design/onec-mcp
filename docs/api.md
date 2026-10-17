@@ -709,7 +709,7 @@ as is). An empty reference has `id` and `type` equal to `""`.
 `sale_document` the sale from its lines (`Товары.ДокументПартии`). `sale_document` is filled only
 for returns entered on the basis of a sale; returns against an order (web orders via `testAPI`),
 manual ones and retail returns in the same shift show «(не указано)» — for them the link to the
-sale is `order` only. "Were there returns for this sale", `find_document(doc_type=РеализацияТоваровУслуг,
+sale is `order` only. "Were there returns for this sale": `find_document(doc_type=РеализацияТоваровУслуг,
 number=…)` → `id` → `returns_report(filters.sale_document_ids=[id], period=…)`. The period must
 cover the **return** dates, not the sale date: returns are selected by their own date.
 
