@@ -1,0 +1,661 @@
+package onec
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"example.com/mcp-sales-mvp/internal/oauth"
+)
+
+// Settings — параметры подключения к одной базе 1С. Приходят из записи тенанта в БД.
+// Авторизация всегда basic.
+type Settings struct {
+	BaseURL  string
+	Username string
+	Password string
+	// Timeout — для быстрых вызовов (resolve_*, auth/verify).
+	Timeout time.Duration
+	// ReportTimeout — для отчётных эндпойнтов (/mcp/reports/*): они сканируют регистры
+	// и легально дольше резолвов (ТЗ availability_report допускает до 30 с).
+	ReportTimeout time.Duration
+	TenantHeader  string
+	DefaultTenant string
+	// ResolveCacheTTL — TTL кэша resolve_*. <= 0 отключает кэш.
+	ResolveCacheTTL time.Duration
+}
+
+// Client — HTTP-клиент одной базы 1С. Экземпляр создаётся на каждый тенант:
+// baseURL, учётка и resolveCache внутри — значит кэш резолвов изолирован по базам сам собой.
+type Client struct {
+	httpClient       *http.Client
+	httpReportClient *http.Client
+	baseURL          string
+	username         string
+	password         string
+	tenantHeader     string
+	defaultTenant    string
+	logger           *slog.Logger
+	resolveCache     *resolveCache
+
+	// Профиль возможностей базы: читается из /mcp/health, живёт CapabilitiesTTL.
+	// Хранится в клиенте, а не глобально, потому что клиент и так создаётся на тенант —
+	// профиль одной базы не может протечь в другую.
+	capsMu     sync.RWMutex
+	caps       *Capabilities
+	capsExpire time.Time
+}
+
+// CapabilitiesVersion — текущая версия структуры профиля (opt-in, tools.available).
+// MinCapabilitiesVersion — самая старая, которую гейт ещё читает: версия 1 (opt-out,
+// tools.unavailable) оставлена на переходный период, чтобы гейт можно было выкатить раньше,
+// чем обновятся базы. Когда все базы отдадут версию 2 — поднять до 2 и удалить ветку версии 1
+// в Capabilities.ToolAvailable.
+const (
+	CapabilitiesVersion    = 2
+	MinCapabilitiesVersion = 1
+)
+
+func NewClient(s Settings, logger *slog.Logger) *Client {
+	return &Client{
+		httpClient: &http.Client{
+			Timeout: s.Timeout,
+		},
+		// отдельный клиент для /mcp/reports/* — отчёты сканируют регистры и легально дольше резолвов
+		httpReportClient: &http.Client{
+			Timeout: s.ReportTimeout,
+		},
+		baseURL:       s.BaseURL,
+		username:      s.Username,
+		password:      s.Password,
+		tenantHeader:  s.TenantHeader,
+		defaultTenant: s.DefaultTenant,
+		logger:        logger,
+		resolveCache:  newResolveCache(s.ResolveCacheTTL),
+	}
+}
+
+// Close освобождает фоновые ресурсы клиента (сейчас — janitor кэша резолвов).
+// Вызывается реестром для баз, вытесненных при пересборке; после него клиент использовать нельзя.
+func (c *Client) Close() {
+	c.resolveCache.Close()
+}
+
+func (c *Client) doRequest(ctx context.Context, method, path string, body interface{}, result interface{}) error {
+	var reqBody io.Reader
+	if body != nil {
+		jsonData, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("failed to marshal request: %w", err)
+		}
+		reqBody = bytes.NewBuffer(jsonData)
+	}
+
+	url := c.baseURL + path
+	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	if c.tenantHeader != "" && c.defaultTenant != "" {
+		req.Header.Set(c.tenantHeader, c.defaultTenant)
+	}
+
+	req.SetBasicAuth(c.username, c.password)
+
+	// Прокидываем sub/scopes резолвнутого пользователя в 1С (defense in depth).
+	// 1С использует X-MCP-Scopes для per-endpoint ACL — даже при компрометации гейта
+	// ключ с mcp:resolve не сможет вызвать report endpoints.
+	if auth := oauth.FromContext(ctx); auth != nil {
+		req.Header.Set("X-MCP-Sub", auth.Sub)
+		// Comma-separated, чтобы парсинг в 1С был прямолинейным (см. RequireScope в HTTPServices/MCP).
+		req.Header.Set("X-MCP-Scopes", strings.Join(auth.Scopes, ","))
+	}
+
+	start := time.Now()
+
+	// Тяжёлые эндпойнты идут через клиент с увеличенным таймаутом; резолвы/auth остаются на коротком,
+	// чтобы быстро падать при недоступности 1С.
+	//
+	// /mcp/admin/* — тоже тяжёлые: журнал регистрации сканируется последовательно, и выборка за сутки
+	// легко перебирает 8 секунд (сам инструмент об этом и предупреждает). На коротком таймауте она
+	// падала с невнятным «context deadline exceeded» вместо того, чтобы просто досчитаться.
+	httpClient := c.httpClient
+	if strings.HasPrefix(path, "/mcp/reports/") || strings.HasPrefix(path, "/mcp/admin/") {
+		httpClient = c.httpReportClient
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		c.logger.Error("1C request", "method", method, "path", path, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			c.logger.Error("1C response body close failed", "method", method, "path", path, "error", err)
+		}
+	}(resp.Body)
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	duration := time.Since(start).Milliseconds()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.logger.Error("1C request", "method", method, "path", path, "status", resp.StatusCode, "duration_ms", duration, "body", string(respBody))
+
+		// Пробуем достать структурированный {error, message} из тела —
+		// 1С отдаёт его осмысленно, и клиент сможет показать пользователю реальную причину
+		apiErr := &APIError{StatusCode: resp.StatusCode}
+		if json.Unmarshal(respBody, apiErr) == nil && (apiErr.Code != "" || apiErr.Message != "") {
+			return apiErr
+		}
+
+		return fmt.Errorf("1C returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	c.logger.Debug("1C request", "method", method, "path", path, "status", resp.StatusCode, "duration_ms", duration)
+
+	if result != nil {
+		if err := json.Unmarshal(respBody, result); err != nil {
+			return fmt.Errorf("failed to unmarshal response: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (c *Client) ResolveCustomer(ctx context.Context, query string, limit int, includeGroups bool) (*ResolveCustomerResponse, error) {
+	cacheKey := "customer"
+	if includeGroups {
+		cacheKey = "customer+groups"
+	}
+	if cached, ok := c.resolveCache.Get(cacheKey, query, limit); ok {
+		var resp ResolveCustomerResponse
+		if err := json.Unmarshal(cached, &resp); err == nil {
+			return &resp, nil
+		}
+	}
+
+	req := ResolveRequest{Query: query, Limit: limit, IncludeGroups: includeGroups}
+	var resp ResolveCustomerResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/resolve/customer", req, &resp); err != nil {
+		return nil, err
+	}
+
+	if payload, err := json.Marshal(&resp); err == nil {
+		c.resolveCache.Set(cacheKey, query, limit, payload)
+	}
+	return &resp, nil
+}
+
+// scopeReportCost — дубль mcp.ScopeReportCost: пакет onec не может импортировать mcp
+// (обратная зависимость). При изменении значения править оба места.
+const scopeReportCost = "mcp:report:cost"
+
+// costScoped — есть ли у вызывающего право на себестоимость. От него зависит СОДЕРЖИМОЕ
+// ответа 1С (производственные склады в resolve_warehouse), поэтому признак обязан входить
+// в ключ кэша: иначе первый же вызов от cost-ключа отдал бы производственные склады
+// всем остальным до конца TTL.
+// auth == nil — легаси-режим без OAuth: заголовок X-MCP-Scopes не отправляется, 1С трактует
+// его отсутствие как полный доступ, поэтому здесь тоже true.
+func costScoped(ctx context.Context) bool {
+	auth := oauth.FromContext(ctx)
+	if auth == nil {
+		return true
+	}
+	return auth.HasScope(scopeReportCost)
+}
+
+func (c *Client) ResolveWarehouse(ctx context.Context, query string, limit int) (*ResolveWarehouseResponse, error) {
+	cacheKey := "warehouse"
+	if costScoped(ctx) {
+		cacheKey = "warehouse+production"
+	}
+	if cached, ok := c.resolveCache.Get(cacheKey, query, limit); ok {
+		var resp ResolveWarehouseResponse
+		if err := json.Unmarshal(cached, &resp); err == nil {
+			return &resp, nil
+		}
+	}
+
+	req := ResolveRequest{Query: query, Limit: limit}
+	var resp ResolveWarehouseResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/resolve/warehouse", req, &resp); err != nil {
+		return nil, err
+	}
+
+	if payload, err := json.Marshal(&resp); err == nil {
+		c.resolveCache.Set(cacheKey, query, limit, payload)
+	}
+	return &resp, nil
+}
+
+// ResolveMaterial — поиск сырья и комплектующих по названию/артикулу. Отдельный эндпойнт 1С:
+// resolve_product отдаёт ровно обратный набор (номенклатуру БЕЗ пометки ДляПроизводства).
+// Инструмент закрыт правом mcp:report:cost, поэтому в ключе кэша признак прав не нужен —
+// без права вызов до клиента не доходит.
+func (c *Client) ResolveMaterial(ctx context.Context, query string, limit int, includeGroups bool) (*ResolveMaterialResponse, error) {
+	cacheKey := "material"
+	if includeGroups {
+		cacheKey = "material+groups"
+	}
+	if cached, ok := c.resolveCache.Get(cacheKey, query, limit); ok {
+		var resp ResolveMaterialResponse
+		if err := json.Unmarshal(cached, &resp); err == nil {
+			return &resp, nil
+		}
+	}
+
+	req := ResolveRequest{Query: query, Limit: limit, IncludeGroups: includeGroups}
+	var resp ResolveMaterialResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/resolve/material", req, &resp); err != nil {
+		return nil, err
+	}
+
+	if payload, err := json.Marshal(&resp); err == nil {
+		c.resolveCache.Set(cacheKey, query, limit, payload)
+	}
+	return &resp, nil
+}
+
+func (c *Client) ResolveProduct(ctx context.Context, query string, limit int, includeGroups bool) (*ResolveProductResponse, error) {
+	cacheKey := "product"
+	if includeGroups {
+		cacheKey = "product+groups"
+	}
+	if cached, ok := c.resolveCache.Get(cacheKey, query, limit); ok {
+		var resp ResolveProductResponse
+		if err := json.Unmarshal(cached, &resp); err == nil {
+			return &resp, nil
+		}
+	}
+
+	req := ResolveRequest{Query: query, Limit: limit, IncludeGroups: includeGroups}
+	var resp ResolveProductResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/resolve/product", req, &resp); err != nil {
+		return nil, err
+	}
+
+	if payload, err := json.Marshal(&resp); err == nil {
+		c.resolveCache.Set(cacheKey, query, limit, payload)
+	}
+	return &resp, nil
+}
+
+func (c *Client) ResolveSalesChannel(ctx context.Context, query string, limit int) (*ResolveSalesChannelResponse, error) {
+	if cached, ok := c.resolveCache.Get("sales_channel", query, limit); ok {
+		var resp ResolveSalesChannelResponse
+		if err := json.Unmarshal(cached, &resp); err == nil {
+			return &resp, nil
+		}
+	}
+
+	req := ResolveRequest{Query: query, Limit: limit}
+	var resp ResolveSalesChannelResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/resolve/sales_channel", req, &resp); err != nil {
+		return nil, err
+	}
+
+	if payload, err := json.Marshal(&resp); err == nil {
+		c.resolveCache.Set("sales_channel", query, limit, payload)
+	}
+	return &resp, nil
+}
+
+// ResolveFirm — поиск фирмы (юрлица) по названию. В многофирменных базах видимый набор
+// фирм зависит от прав учётной записи, а не только от scope, поэтому в ключ кэша входит sub
+// вызывающего: иначе выдача одной учётки досталась бы другой с иным списком разрешённых фирм.
+func (c *Client) ResolveFirm(ctx context.Context, query string, limit int) (*ResolveFirmResponse, error) {
+	cacheKey := "firm|" + firmCacheScope(ctx)
+	if cached, ok := c.resolveCache.Get(cacheKey, query, limit); ok {
+		var resp ResolveFirmResponse
+		if err := json.Unmarshal(cached, &resp); err == nil {
+			return &resp, nil
+		}
+	}
+
+	req := ResolveRequest{Query: query, Limit: limit}
+	var resp ResolveFirmResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/resolve/firm", req, &resp); err != nil {
+		return nil, err
+	}
+
+	if payload, err := json.Marshal(&resp); err == nil {
+		c.resolveCache.Set(cacheKey, query, limit, payload)
+	}
+	return &resp, nil
+}
+
+// firmCacheScope — часть ключа кэша, разделяющая выдачу resolve_firm по учётным записям.
+// Без OAuth (легаси-режим со статическим токеном) учётка одна на всех — общий сегмент "-".
+func firmCacheScope(ctx context.Context) string {
+	auth := oauth.FromContext(ctx)
+	if auth == nil || auth.Sub == "" {
+		return "-"
+	}
+	return auth.Sub
+}
+
+func (c *Client) ResolveCash(ctx context.Context, query string, limit int) (*ResolveCashResponse, error) {
+	if cached, ok := c.resolveCache.Get("cash", query, limit); ok {
+		var resp ResolveCashResponse
+		if err := json.Unmarshal(cached, &resp); err == nil {
+			return &resp, nil
+		}
+	}
+
+	req := ResolveRequest{Query: query, Limit: limit}
+	var resp ResolveCashResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/resolve/cash", req, &resp); err != nil {
+		return nil, err
+	}
+
+	if payload, err := json.Marshal(&resp); err == nil {
+		c.resolveCache.Set("cash", query, limit, payload)
+	}
+	return &resp, nil
+}
+
+func (c *Client) ResolveCostArticle(ctx context.Context, query string, limit int, includeGroups bool) (*ResolveCostArticleResponse, error) {
+	// Ключ кэша обязан учитывать includeGroups (как у customer/product): без этого выдача без групп
+	// затирала выдачу с группами на весь TTL, и запрошенные UUID групп просто не возвращались.
+	cacheKey := "cost_article"
+	if includeGroups {
+		cacheKey = "cost_article+groups"
+	}
+	if cached, ok := c.resolveCache.Get(cacheKey, query, limit); ok {
+		var resp ResolveCostArticleResponse
+		if err := json.Unmarshal(cached, &resp); err == nil {
+			return &resp, nil
+		}
+	}
+
+	req := ResolveRequest{Query: query, Limit: limit, IncludeGroups: includeGroups}
+	var resp ResolveCostArticleResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/resolve/cost_article", req, &resp); err != nil {
+		return nil, err
+	}
+
+	if payload, err := json.Marshal(&resp); err == nil {
+		c.resolveCache.Set(cacheKey, query, limit, payload)
+	}
+	return &resp, nil
+}
+
+func (c *Client) ResolveOperation(ctx context.Context, query string, limit int) (*ResolveOperationResponse, error) {
+	if cached, ok := c.resolveCache.Get("operation", query, limit); ok {
+		var resp ResolveOperationResponse
+		if err := json.Unmarshal(cached, &resp); err == nil {
+			return &resp, nil
+		}
+	}
+
+	req := ResolveRequest{Query: query, Limit: limit}
+	var resp ResolveOperationResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/resolve/operation", req, &resp); err != nil {
+		return nil, err
+	}
+
+	if payload, err := json.Marshal(&resp); err == nil {
+		c.resolveCache.Set("operation", query, limit, payload)
+	}
+	return &resp, nil
+}
+
+func (c *Client) CashBalance(ctx context.Context, req *CashBalanceRequest) (*CashReportResponse, error) {
+	var resp CashReportResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/cash_balance", req, &resp); err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+func (c *Client) CashFlow(ctx context.Context, req *CashFlowRequest) (*CashReportResponse, error) {
+	var resp CashReportResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/cash_flow", req, &resp); err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+func (c *Client) SalesReport(ctx context.Context, req *SalesReportRequest) (*SalesReportResponse, error) {
+	var resp SalesReportResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/sales", req, &resp); err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+func (c *Client) StockReport(ctx context.Context, req *StockReportRequest) (*StockReportResponse, error) {
+	var resp StockReportResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/stock", req, &resp); err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+func (c *Client) AvailabilityReport(ctx context.Context, req *AvailabilityReportRequest) (json.RawMessage, error) {
+	var resp json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/availability", req, &resp); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+func (c *Client) ProductDetails(ctx context.Context, req *ProductDetailsRequest) (json.RawMessage, error) {
+	var resp json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/product_details", req, &resp); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+func (c *Client) Receivables(ctx context.Context, req *ReceivablesRequest) (*SettlementsResponse, error) {
+	var resp SettlementsResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/receivables", req, &resp); err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+func (c *Client) Payables(ctx context.Context, req *PayablesRequest) (*SettlementsResponse, error) {
+	var resp SettlementsResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/payables", req, &resp); err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+func (c *Client) Purchases(ctx context.Context, req *PurchasesRequest) (*PurchasesResponse, error) {
+	var resp PurchasesResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/purchases", req, &resp); err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+// GoodsInTransit — остатки товаров в пути (регистр ОстаткиТоваровВПути). Тело ответа
+// пробрасывается как есть: состав колонок задаёт 1С, гейту декомпозиция не нужна.
+func (c *Client) GoodsInTransit(ctx context.Context, req *GoodsInTransitRequest) (json.RawMessage, error) {
+	var resp json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/goods_in_transit", req, &resp); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// StockReserves — детализация резервов (регистр РезервыТоваров). Ответ пробрасывается
+// как есть: состав колонок задаёт 1С.
+func (c *Client) StockReserves(ctx context.Context, req *ReservesRequest) (json.RawMessage, error) {
+	var resp json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/reserves", req, &resp); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// ReturnsReport — возвраты товаров от покупателей за период. Ответ пробрасывается как есть:
+// состав колонок задаёт 1С.
+func (c *Client) ReturnsReport(ctx context.Context, req *ReturnsRequest) (json.RawMessage, error) {
+	var resp json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/returns", req, &resp); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+// TopProducts / CustomerSummary возвращаются как json.RawMessage —
+// гейту достаточно прокинуть тело наверх, без декомпозиции в типизированную структуру.
+// Это позволяет добавлять поля в 1С-стороне без правки гейта.
+func (c *Client) TopProducts(ctx context.Context, req *TopProductsRequest) (json.RawMessage, error) {
+	var resp json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/top_products", req, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (c *Client) CustomerSummary(ctx context.Context, req *CustomerSummaryRequest) (json.RawMessage, error) {
+	var resp json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/customer_summary", req, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// ProductionReport — единая точка для производственного блока (спецификации и документы
+// Производство). Отчётов девять, тело у них разное, а обработка одинаковая: passthrough
+// json.RawMessage, как у top_products/customer_summary — новые поля на стороне 1С не требуют
+// правок гейта. reportType берётся только из констант Report* этого пакета: наружу путь
+// не параметризуется, подставить произвольный сегмент клиент не может.
+func (c *Client) ProductionReport(ctx context.Context, reportType string, body any) (json.RawMessage, error) {
+	var resp json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/reports/"+reportType, body, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// EventLog проксирует тело админ-инструмента чтения журнала регистрации (event_log /
+// object_history) в 1С. Тело передаётся как есть — 1С сама разбирает поля
+// user/session/level/events/object_type/object_id/period/limit. Ответ возвращается
+// json.RawMessage: гейту достаточно прокинуть его наверх, без типизированной декомпозиции.
+func (c *Client) EventLog(ctx context.Context, body any) (json.RawMessage, error) {
+	var resp json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/admin/eventlog", body, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// FindDocument резолвит документ по типу+номеру+дате; тело и ответ — passthrough.
+func (c *Client) FindDocument(ctx context.Context, body any) (json.RawMessage, error) {
+	var resp json.RawMessage
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/admin/find_document", body, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// VerifyMCPKey проверяет MCP-ключ через 1С. Возвращает APIError со статусом 401, если ключ невалиден —
+// вызывающий код должен это отличать от network/server ошибок.
+func (c *Client) VerifyMCPKey(ctx context.Context, key string) (*AuthVerifyResponse, error) {
+	req := AuthVerifyRequest{Key: key}
+	var resp AuthVerifyResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/mcp/auth/verify", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// CapabilitiesTTL — как долго профиль базы считается свежим. Профиль меняется вместе с
+// кодом интеграции в 1С, то есть редко, а tools/list зовётся на каждую сессию модели —
+// поэтому кэш обязателен, но и протухать он должен без перезапуска гейта.
+const CapabilitiesTTL = 5 * time.Minute
+
+// CapabilitiesRetryTTL — через сколько повторить health после сетевой ошибки. Короче
+// основного TTL: пока профиль не получен, гейт работает по устаревшим или неполным данным.
+const CapabilitiesRetryTTL = 30 * time.Second
+
+// Capabilities возвращает профиль возможностей базы из GET /mcp/health, с кэшем на
+// CapabilitiesTTL. Три исхода различаются намеренно:
+//
+//   - 1С ответила понятным профилем — он и возвращается.
+//   - 1С ответила, но профиля нет или его версия незнакома — возвращается пустой профиль
+//     текущей версии: база ничего не подтвердила, значит, инструментов у неё нет. Раньше
+//     это был fail-open, и именно так не реализованные в базе инструменты доезжали до модели.
+//   - 1С не ответила (сеть, 5xx) — возвращается последний полученный профиль: сбой связи
+//     ничего не говорит о возможностях базы. Если профиля ещё не было — nil, то есть
+//     «неизвестно» (см. Capabilities.ToolAvailable).
+//
+// Профиль уточняет выдачу, но не является контролем доступа: границу держат скоупы и
+// проверки в самой 1С.
+func (c *Client) Capabilities(ctx context.Context) *Capabilities {
+	c.capsMu.RLock()
+	caps, fresh := c.caps, time.Now().Before(c.capsExpire)
+	c.capsMu.RUnlock()
+
+	if fresh {
+		return caps
+	}
+
+	var health HealthResponse
+	if err := c.doRequest(ctx, http.MethodGet, "/mcp/health", nil, &health); err != nil {
+		c.logger.Warn("onec.capabilities.failed", "error", err)
+		// Кэшируем и неудачу, иначе каждый tools/list при лежащей 1С добавлял бы к себе
+		// сетевой таймаут. Последний известный профиль при этом сохраняется.
+		c.storeCapabilities(caps, CapabilitiesRetryTTL)
+		return caps
+	}
+
+	got := health.Capabilities
+
+	switch {
+	case got == nil:
+		c.logger.Error("onec.capabilities.missing",
+			"hint", "1C health carries no capabilities profile; no tools are confirmed")
+		got = &Capabilities{Version: CapabilitiesVersion}
+	case got.Version < MinCapabilitiesVersion || got.Version > CapabilitiesVersion:
+		c.logger.Error("onec.capabilities.version_mismatch",
+			"profile", got.Profile, "got", got.Version,
+			"min", MinCapabilitiesVersion, "max", CapabilitiesVersion)
+		got = &Capabilities{Profile: got.Profile, Version: CapabilitiesVersion}
+	}
+
+	c.storeCapabilities(got, CapabilitiesTTL)
+
+	return got
+}
+
+func (c *Client) storeCapabilities(caps *Capabilities, ttl time.Duration) {
+	c.capsMu.Lock()
+	c.caps = caps
+	c.capsExpire = time.Now().Add(ttl)
+	c.capsMu.Unlock()
+}
